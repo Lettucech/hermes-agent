@@ -12,6 +12,7 @@ issue / PR, then — only when cornered — a source patch).
 | Commit | What | Upstream | Revert when |
 |---|---|---|---|
 | `229c4367cd` | Slack processing indicator: `_session_status_method` pinned to legacy `assistant_threads_setStatus` — slack-sdk >= 3.44 rejects free-text status on `agents.sessions` (`invalid_arguments`), so the indicator silently vanished | issue #110374; fix PRs #110389 / #110391 | those PRs land |
+| `c2604c75df` | Block Kit renderer: `container` (collapsible `:::details`) / `context` / `image` / `actions`-URL rendering added to `render_blocks` + `sanitize_blocks` | feature gap; contribution declined (2026-10-23) | keep — local feature |
 
 ## Where the rest lives
 
