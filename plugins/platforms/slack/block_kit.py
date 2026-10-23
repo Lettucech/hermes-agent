@@ -39,6 +39,10 @@ MAX_HEADER_TEXT = 150
 MAX_TABLE_ROWS = 100
 MAX_TABLE_COLS = 20
 MAX_TABLE_CHARS = 10000  # aggregate across all cells
+# Container / context / actions limits (https://docs.slack.dev/reference/block-kit/blocks)
+MAX_CONTAINER_CHILDREN = 10
+MAX_CONTEXT_ELEMENTS = 10
+MAX_ACTIONS_ELEMENTS = 25
 
 Block = dict[str, Any]
 
@@ -53,6 +57,13 @@ _ORDERED_RE = re.compile(r"^(\s*)(\d+)[.)]\s+(.*)$")
 _BULLET_RE = re.compile(r"^(\s*)[-*+]\s+(.*)$")
 _QUOTE_RE = re.compile(r"^\s{0,3}>\s?(.*)$")
 _TABLE_SEP_RE = re.compile(r"^\s*\|?\s*:?-{1,}:?\s*(\|\s*:?-{1,}:?\s*)+\|?\s*$")
+# Container family: ``:::details Title`` / ``:::details-open Title`` / ``:::context``
+# / ``:::actions`` … closing ``:::`` (longest alternation first: details-open > details).
+_CONTAINER_OPEN_RE = re.compile(
+    r"^\s{0,3}:::(details-open|details|context|actions)(?:\s+(.*?))?\s*$")
+_CONTAINER_CLOSE_RE = re.compile(r"^\s{0,3}:::\s*$")
+_IMG_ONLY_RE = re.compile(r"^\s{0,3}!\[([^\]]*)\]\(\s*([^)\s]+)\s*\)\s*$")
+_MD_LINK_LINE_RE = re.compile(r"^\s*\[([^\]]+)\]\(([^)\s]+)\)\s*$")
 
 
 def _is_list_line(line: str) -> bool:
@@ -233,6 +244,102 @@ def _section_block(text: str) -> Block:
 
 
 # ----------------------------------------------------------------------------
+# Container family — collapsible container / context / URL-button actions
+# ----------------------------------------------------------------------------
+
+
+def _image_block(alt: str, url: str) -> Block:
+    return {"type": "image", "image_url": url, "alt_text": (alt.strip() or "image")[:2000]}
+
+
+def _context_block(lines: list[str]) -> Optional[Block]:
+    """``:::context`` body lines → one ``context`` block (small metadata text).
+    Slack caps a context block at 10 elements, so overflow lines merge into the
+    last element instead of being dropped."""
+    els: list[dict[str, Any]] = [{"type": "mrkdwn", "text": ln.strip()} for ln in lines if ln.strip()]
+    if not els:
+        return None
+    if len(els) > MAX_CONTEXT_ELEMENTS:
+        head = els[: MAX_CONTEXT_ELEMENTS - 1]
+        tail = "\n".join(e["text"] for e in els[MAX_CONTEXT_ELEMENTS - 1 :])
+        head.append({"type": "mrkdwn", "text": tail})
+        els = head
+    return {"type": "context", "elements": els}
+
+
+def _actions_block(lines: list[str], fmt) -> list[Block]:
+    """``:::actions`` body → an ``actions`` block of URL buttons plus any
+    non-button lines rendered as ordinary blocks (content is never dropped).
+    URL buttons need no interaction callback, so this works with zero adapter
+    changes; interactive (value-bearing) buttons are deliberately out of scope."""
+    out: list[Block] = []
+    buttons: list[dict[str, Any]] = []
+    extra_links: list[dict[str, Any]] = []
+    leftover: list[str] = []
+    for ln in lines:
+        m = _MD_LINK_LINE_RE.match(ln)
+        if m:
+            label = re.sub(r"[*_~`]", "", m.group(1)).strip() or "link"
+            if len(buttons) < MAX_ACTIONS_ELEMENTS:
+                buttons.append({
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": label[:75], "emoji": True},
+                    "url": m.group(2),
+                    "action_id": f"url_button_{len(buttons) + len(extra_links) + 1}",
+                })
+            else:
+                extra_links.append({"type": "link", "url": m.group(2), "text": label})
+        elif ln.strip():
+            leftover.append(ln)
+    if leftover:
+        out.extend(render_blocks("\n".join(leftover), fmt) or [])
+    if extra_links:
+        out.append(_rich_text_block("rich_text_section", extra_links))
+    if buttons:
+        out.append({"type": "actions", "elements": buttons})
+    return out
+
+
+def _flatten_container_children(children: list[Block]) -> list[Block]:
+    """Slack containers cannot nest (``container`` is not a valid container
+    child type), so a nested container degrades to its header + children inline."""
+    out: list[Block] = []
+    for c in children:
+        if isinstance(c, dict) and c.get("type") == "container":
+            title = (c.get("title") or {}).get("text")
+            if title:
+                out.append(_header_block(title) or _divider_block())
+            out.extend(_flatten_container_children(c.get("child_blocks") or []))
+        else:
+            out.append(c)
+    return out
+
+
+def _details_container(collapsed: bool, title: str, body: list[str], fmt) -> list[Block]:
+    """``:::details`` / ``:::details-open`` body → one collapsible ``container``.
+    Degrades to flat blocks (title as header) when the body needs more than
+    Slack's 10 ``child_blocks`` — collapse is a nicety, content loss is not."""
+    children = _flatten_container_children(render_blocks("\n".join(body), fmt) or [])
+    if not children:
+        return []
+    clean_title = re.sub(r"[*_~`]", "", title).strip()
+    if len(children) <= MAX_CONTAINER_CHILDREN:
+        block: Block = {
+            "type": "container",
+            "is_collapsible": True,
+            "default_collapsed": collapsed,
+            "child_blocks": children,
+        }
+        if clean_title:
+            block["title"] = {"type": "plain_text", "text": clean_title[:MAX_HEADER_TEXT], "emoji": True}
+        return [block]
+    head = _header_block(clean_title) if clean_title else None
+    out: list[Block] = [head] if head is not None else []
+    out.extend(children)
+    return out
+
+
+# ----------------------------------------------------------------------------
 # Table handling — native Block Kit ``table`` block, monospace fallback
 # ----------------------------------------------------------------------------
 
@@ -350,6 +457,11 @@ def render_blocks(markdown: str, mrkdwn_fn=None) -> Optional[list[Block]]:
             para.clear()
             if not text:
                 return
+            # A paragraph that is exactly one markdown image → native image block.
+            img = _IMG_ONLY_RE.match(text)
+            if img:
+                blocks.append(_image_block(img.group(1), img.group(2)))
+                return
             rendered = fmt(text)
             # Split oversized sections on the 3000-char limit.
             for chunk in _split_text(rendered, MAX_SECTION_TEXT):
@@ -375,6 +487,29 @@ def render_blocks(markdown: str, mrkdwn_fn=None) -> Optional[list[Block]]:
                     i += 1
                 i += 1  # consume closing fence
                 blocks.append(_preformatted_block("\n".join(body)))
+                continue
+
+            # Container family: :::details / :::details-open / :::context / :::
+            # actions … closing :::
+            dm = _CONTAINER_OPEN_RE.match(line)
+            if dm:
+                flush_para()
+                kind, arg = dm.group(1), dm.group(2) or ""
+                cbody: list[str] = []
+                i += 1
+                while i < n and not _CONTAINER_CLOSE_RE.match(lines[i]):
+                    cbody.append(lines[i])
+                    i += 1
+                if i < n:
+                    i += 1  # consume closing :::
+                if kind == "context":
+                    cb = _context_block(cbody)
+                    if cb is not None:
+                        blocks.append(cb)
+                elif kind == "actions":
+                    blocks.extend(_actions_block(cbody, fmt))
+                else:
+                    blocks.extend(_details_container(kind == "details", arg, cbody, fmt))
                 continue
 
             # Horizontal rule → divider
@@ -612,6 +747,28 @@ def sanitize_blocks(blocks: Optional[list[Block]]) -> Optional[list[Block]]:
                         block["column_settings"] = fixed
                     else:
                         block.pop("column_settings", None)
+            elif btype == "container":
+                children = block.get("child_blocks") or []
+                if not children:
+                    continue
+                # Nested containers are invalid as child blocks — flatten them.
+                sane = _flatten_container_children(sanitize_blocks(list(children)) or [])
+                if not sane:
+                    continue
+                block = dict(block)
+                block["child_blocks"] = sane[:MAX_CONTAINER_CHILDREN]
+                for key in ("title", "subtitle"):
+                    tobj = block.get(key)
+                    if isinstance(tobj, dict):
+                        clamped = _clamp_text_obj(tobj, MAX_HEADER_TEXT)
+                        if clamped is not tobj:
+                            block[key] = clamped
+            elif btype == "image":
+                if not (block.get("image_url") or "").strip():
+                    continue
+                if not isinstance(block.get("alt_text"), str):
+                    block = dict(block)
+                    block["alt_text"] = "image"
             out.append(block)
         if not out:
             return None

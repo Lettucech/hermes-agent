@@ -255,3 +255,125 @@ class TestSplitTextFenceBalanced:
             )
 
 
+
+
+class TestContainerFamily:
+    def test_details_renders_collapsible_container(self):
+        md = ":::details Steps\n- one\n- two\n:::"
+        blocks = render_blocks(md)
+        assert len(blocks) == 1
+        c = blocks[0]
+        assert c["type"] == "container"
+        assert c["is_collapsible"] is True
+        assert c["default_collapsed"] is True
+        assert c["title"]["text"] == "Steps"
+        assert c["child_blocks"]
+
+    def test_details_open_defaults_expanded(self):
+        blocks = render_blocks(":::details-open Notes\nhello\n:::")
+        assert blocks[0]["type"] == "container"
+        assert blocks[0]["default_collapsed"] is False
+
+    def test_nested_container_flattens(self):
+        md = ":::details outer\n:::details inner\nx\n:::\n:::"
+        blocks = render_blocks(md)
+        c = blocks[0]
+        assert c["type"] == "container"
+        assert all(b["type"] != "container" for b in c["child_blocks"])
+
+    def test_over_ten_children_degrades_to_flat(self):
+        body = "\n\n".join(f"para {k}" for k in range(12))
+        blocks = render_blocks(f":::details many\n{body}\n:::")
+        assert blocks[0]["type"] == "header"
+        assert blocks[0]["text"]["text"] == "many"
+        assert all(b["type"] != "container" for b in blocks)
+
+    def test_unclosed_details_still_renders_body(self):
+        blocks = render_blocks(":::details t\nhello")
+        assert blocks[0]["type"] == "container"
+        assert blocks[0]["child_blocks"]
+
+    def test_empty_details_body_dropped(self):
+        assert render_blocks(":::details t\n:::") is None
+
+    def test_details_inside_fence_not_treated_as_container(self):
+        md = "```\n:::details not-a-container\n```"
+        blocks = render_blocks(md)
+        assert _types(blocks) == ["rich_text"]
+
+
+class TestContextAndImage:
+    def test_context_block(self):
+        blocks = render_blocks(":::context\nsmall print\nsecond line\n:::")
+        assert _types(blocks) == ["context"]
+        assert blocks[0]["elements"][0]["text"] == "small print"
+        assert blocks[0]["elements"][1]["text"] == "second line"
+
+    def test_context_overflow_lines_merge_into_last_element(self):
+        body = "\n".join(f"line {k}" for k in range(14))
+        blocks = render_blocks(f":::context\n{body}\n:::")
+        assert len(blocks[0]["elements"]) == 10
+
+    def test_standalone_image_becomes_image_block(self):
+        blocks = render_blocks("![alt text](https://example.com/a.png)")
+        assert _types(blocks) == ["image"]
+        assert blocks[0]["image_url"] == "https://example.com/a.png"
+        assert blocks[0]["alt_text"] == "alt text"
+
+    def test_image_with_empty_alt_defaults(self):
+        blocks = render_blocks("![](https://example.com/a.png)")
+        assert blocks[0]["alt_text"] == "image"
+
+    def test_mixed_text_and_image_stays_section(self):
+        blocks = render_blocks("look ![x](https://e.com/i.png) here")
+        assert _types(blocks) == ["section"]
+
+
+class TestActionsBlock:
+    def test_actions_url_buttons(self):
+        md = ":::actions\n[Approve](https://x.co/a)\n[Reject](https://x.co/r)\n:::"
+        blocks = render_blocks(md)
+        assert _types(blocks) == ["actions"]
+        btns = blocks[0]["elements"]
+        assert [b["url"] for b in btns] == ["https://x.co/a", "https://x.co/r"]
+        assert btns[0]["text"]["text"] == "Approve"
+
+    def test_actions_non_button_lines_kept(self):
+        md = ":::actions\nnote line\n[Go](https://x.co)\n:::"
+        blocks = render_blocks(md)
+        assert _types(blocks) == ["section", "actions"]
+
+    def test_actions_without_buttons_no_actions_block(self):
+        md = ":::actions\njust words\n:::"
+        blocks = render_blocks(md)
+        assert _types(blocks) == ["section"]
+
+
+class TestSanitizeContainers:
+    def test_sanitize_flattens_nested_containers(self):
+        inner = {"type": "container", "title": {"type": "plain_text", "text": "in"},
+                 "is_collapsible": True, "child_blocks": [{"type": "divider"}]}
+        outer = {"type": "container", "title": {"type": "plain_text", "text": "out"},
+                 "is_collapsible": True, "child_blocks": [inner]}
+        out = sanitize_blocks([outer])
+        kids = out[0]["child_blocks"]
+        assert all(k["type"] != "container" for k in kids)
+
+    def test_sanitize_drops_image_without_url(self):
+        assert sanitize_blocks([{"type": "image", "alt_text": "x"}]) is None
+
+    def test_sanitize_fills_missing_alt_text(self):
+        out = sanitize_blocks([{"type": "image", "image_url": "https://e.com/i.png"}])
+        assert out[0]["alt_text"] == "image"
+
+    def test_sanitize_truncates_over_ten_children(self):
+        kids = [{"type": "divider"} for _ in range(14)]
+        c = {"type": "container", "title": {"type": "plain_text", "text": "t"},
+             "is_collapsible": True, "child_blocks": kids}
+        out = sanitize_blocks([c])
+        assert len(out[0]["child_blocks"]) == 10
+
+    def test_sanitize_drops_container_without_children(self):
+        c = {"type": "container", "title": {"type": "plain_text", "text": "t"},
+             "is_collapsible": True, "child_blocks": []}
+        assert sanitize_blocks([c]) is None
