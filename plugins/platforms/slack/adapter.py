@@ -292,11 +292,14 @@ def _sdk_supports_agent_sessions() -> bool:
 
 
 def _session_status_method(client: Any):
-    """Return the status setter: Agent Sessions API when available, else legacy."""
-    if _sdk_supports_agent_sessions():
-        method = getattr(client, "agents_sessions_setStatus", None)
-        if method is not None:
-            return method
+    """Return the status setter (legacy ``assistant.threads.setStatus`` only).
+
+    LOCAL PATCH (issue #110374): ``agents.sessions.setStatus`` (slack-sdk >= 3.44) accepts
+    only the closed enum active|processing|suspended|closed, so our free-text status
+    phrases and the empty-string clear are rejected as ``invalid_arguments`` — debug-logged
+    only, so the indicator silently vanishes. Legacy keeps free text + auto-clear on reply;
+    restore the SDK-capability choice once upstream lands the real fix (PRs #110391/#110389).
+    """
     return client.assistant_threads_setStatus
 
 
